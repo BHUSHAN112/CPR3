@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>CPR Sensor Bluetooth</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<link rel="manifest" href="manifest.json" />
+<style>
+  body {
+    font-family: Arial, sans-serif;
+    background: #ffffff;
+    text-align: center;
+    padding: 20px;
+  }
+  h2 { color: #2e7d32; margin-bottom: 10px; }
+  .btn {
+    padding: 10px 20px;
+    margin: 8px;
+    font-size: 16px;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  #connectBtn { background: #388e3c; color: white; }
+  #disconnectBtn { background: #d32f2f; color: white; display: none; }
+  #startTrainingBtn { background: #388e3c; color: white; display: none; }
+  #stopTrainingBtn { background: #f57c00; color: white; display: none; }
+  #downloadBtn { background: #fbc02d; color: black; display: none; }
+  #traineeName { padding: 8px; font-size: 14px; display: none; border-radius: 6px; border: 1px solid #ccc; }
+  .status-dot {
+    display: inline-block;
+    width: 12px; height: 12px;
+    border-radius: 50%;
+    background: #d32f2f;
+    margin-left: 8px;
+  }
+
+  /* Gauge container */
+  .gauge-container {
+    margin-top: 30px;
+    width: 360px;
+    height: 200px;
+    margin-left: auto;
+    margin-right: auto;
+    position: relative;
+  }
+  svg { width: 100%; height: 100%; overflow: visible; }
+  .needle {
+    stroke-width: 6;
+    transform-origin: 180px 170px; /* MUST match center coordinates below */
+    transition: transform 0.6s ease-in-out, stroke 0.25s ease-in-out;
+    stroke-linecap: round;
+  }
+  .needle-shadow {
+    stroke: rgba(0,0,0,0.18);
+    stroke-width: 9;
+    transform-origin: 180px 170px;
+    stroke-linecap: round;
+  }
+  .center-cap { fill: #37474f; }
+
+  /* labels/ticks style */
+  .tick-label { font-size: 12px; fill: #37474f; text-anchor: middle; }
+  .tick-line { stroke: #37474f; stroke-width: 2; stroke-linecap: round; }
+  .tick-major { stroke-width: 3; }
+</style>
+</head>
+<body>
+
+<h2>CPR Sensor <span class="status-dot" id="statusDot"></span></h2>
+
+<button id="connectBtn" class="btn">Connect</button>
+<button id="disconnectBtn" class="btn">Disconnect</button>
+
+<br>
+
+<input id="traineeName" placeholder="Enter trainee name" />
+<button id="startTrainingBtn" class="btn">Start Training</button>
+<button id="stopTrainingBtn" class="btn">Stop Training</button>
+<button id="downloadBtn" class="btn">Download CSV</button>
+
+<div class="gauge-container" aria-hidden="false">
+  <!--
+    SVG configured for:
+      center: (cx=180, cy=170)
+      radius: r = 130
+    Semicircle angles map:
+      rate 0  -> angle 180°
+      rate 60 -> angle 270° (top center)
+      rate120 -> angle 360° (rightmost)
+  -->
+  <svg viewBox="0 0 360 200" role="img" aria-label="CPR Rate Gauge">
+    <!-- Color zones (precomputed points for cx=180,cy=170,r=130) -->
+    <!-- Red zone: 0–80  -> angle 180 -> 300 -->
+    <path d="M 50 170 A 130 130 0 0 1 245 57.4167" stroke="#d32f2f" stroke-width="18" fill="none" stroke-linecap="round"/>
+    <!-- Yellow zone: 80–100 -> angle 300 -> 330 -->
+    <path d="M 245 57.4167 A 130 130 0 0 1 292.583 105" stroke="#fbc02d" stroke-width="18" fill="none" stroke-linecap="round"/>
+    <!-- Green zone: 100–120 -> angle 330 -> 360 -->
+    <path d="M 292.583 105 A 130 130 0 0 1 310 170" stroke="#388e3c" stroke-width="18" fill="none" stroke-linecap="round"/>
+
+    <!-- ticks group will be populated by JS -->
+    <g id="ticks"></g>
+
+    <!-- needle shadow then needle (initially pointing up, rotation applied with JS) -->
+    <line id="needleShadow" x1="180" y1="170" x2="180" y2="70" class="needle-shadow"/>
+    <line id="needle" x1="180" y1="170" x2="180" y2="70" class="needle" stroke="#37474f"/>
+    <circle cx="180" cy="170" r="7" class="center-cap"/>
+  </svg>
+</div>
+
+<script>
+/* ====== CONFIG ====== */
+const SERVICE_UUID = '6e400001-c352-11e5-953d-0002a5d5c51b';
+const CHARACTERISTIC_UUID = '6e400003-c352-11e5-953d-0002a5d5c51b';
+
+/* Gauge geometry - keep consistent with SVG above */
+const cx = 180;
+const cy = 170;
+const r = 130;
+const maxRate = 120;
+
+/* UI elements */
+const connectBtn = document.getElementById('connectBtn');
+const disconnectBtn = document.getElementById('disconnectBtn');
+const startTrainingBtn = document.getElementById('startTrainingBtn');
+const stopTrainingBtn = document.getElementById('stopTrainingBtn');
+const downloadBtn = document.getElementById('downloadBtn');
+const traineeNameInput = document.getElementById('traineeName');
+const statusDot = document.getElementById('statusDot');
+const ticksGroup = document.getElementById('ticks');
+const needle = document.getElementById('needle');
+const needleShadow = document.getElementById('needleShadow');
+
+let device = null;
+let characteristic = null;
+let logging = false;
+let traineeName = "";
+let sessionData = []; // { trainee, time, rate }
+
+/* ====== DRAW TICKS (0..120 every 10) ====== */
+function drawTicks() {
+  // Clear previous if any
+  while (ticksGroup.firstChild) ticksGroup.removeChild(ticksGroup.firstChild);
+
+  for (let value = 0; value <= maxRate; value += 10) {
+    const f = value / maxRate;
+    const angleDeg = 180 + f * 180;                // 180..360 deg
+    const rad = angleDeg * Math.PI / 180;
+
+    // outer and inner radii for ticks
+    const tickOuter = r;
+    const tickLen = (value % 20 === 0) ? 18 : 10;  // major at 20 intervals
+    const tickInner = r - tickLen;
+
+    const x1 = cx + tickOuter * Math.cos(rad);
+    const y1 = cy + tickOuter * Math.sin(rad);
+    const x2 = cx + tickInner * Math.cos(rad);
+    const y2 = cy + tickInner * Math.sin(rad);
+
+    const tick = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    tick.setAttribute("x1", x1.toFixed(3));
+    tick.setAttribute("y1", y1.toFixed(3));
+    tick.setAttribute("x2", x2.toFixed(3));
+    tick.setAttribute("y2", y2.toFixed(3));
+    tick.setAttribute("class", "tick-line");
+    if (value % 20 === 0) tick.classList.add('tick-major');
+    ticksGroup.appendChild(tick);
+
+    // label position (slightly further inside)
+    const labelRadius = r - 35;
+    const lx = cx + labelRadius * Math.cos(rad);
+    const ly = cy + labelRadius * Math.sin(rad);
+
+    const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    label.setAttribute("x", lx.toFixed(3));
+    label.setAttribute("y", (ly + 4).toFixed(3)); // nudge down
+    label.setAttribute("class", "tick-label");
+    label.textContent = value;
+    ticksGroup.appendChild(label);
+  }
+}
+
+/* ====== NEEDLE UPDATE ======
+   Mapping:
+     rate 0  => angleDeg = 180  (left)
+     rate 60 => angleDeg = 270  (top)
+     rate120 => angleDeg = 360  (right)
+   The needle element is initially pointing UP (north) — CSS rotation is relative to that.
+   Initial orientation angle = 270° (or -90°). So we rotate by (angleDeg - 270).
+*/
+function updateNeedle(rate) {
+  const limited = Math.max(0, Math.min(rate, maxRate));
+  const angleDeg = 180 + (limited / maxRate) * 180;
+  const rotation = angleDeg - 270; // rotate relative to initial up position
+  needle.style.transform = `rotate(${rotation}deg)`;
+  needleShadow.style.transform = `rotate(${rotation}deg)`;
+
+  // color by zone
+  if (rate >= 100 && rate <= 120) {
+    needle.setAttribute('stroke', '#388e3c');
+  } else if (rate >= 80 && rate < 100) {
+    needle.setAttribute('stroke', '#fbc02d');
+  } else {
+    needle.setAttribute('stroke', '#d32f2f');
+  }
+}
+
+/* ====== BLUETOOTH + LOGIC ====== */
+connectBtn.addEventListener('click', async () => {
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'Proteus' }],
+      optionalServices: [SERVICE_UUID]
+    });
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+    characteristic = await service.getCharacteristic(CHARACTERISTIC_UUID);
+
+    characteristic.addEventListener('characteristicvaluechanged', event => {
+      const raw = new TextDecoder().decode(event.target.value).trim();
+      // Expect text like "CPR RATE: 102.5" or similar
+      const m = raw.match(/CPR RATE:\s*([\d.]+)/i);
+      if (m) {
+        const rate = parseFloat(m[1]);
+        if (logging) {
+          sessionData.push({ trainee: traineeName, time: new Date().toISOString(), rate });
+        }
+        updateNeedle(rate);
+      }
+    });
+
+    await characteristic.startNotifications();
+
+    // UI changes
+    statusDot.style.background = '#388e3c';
+    connectBtn.style.display = 'none';
+    disconnectBtn.style.display = 'inline-block';
+    traineeNameInput.style.display = 'inline-block';
+    startTrainingBtn.style.display = 'inline-block';
+    downloadBtn.style.display = 'none';
+    stopTrainingBtn.style.display = 'none';
+  } catch (err) {
+    alert('Bluetooth Error: ' + (err && err.message ? err.message : err));
+  }
+});
+
+disconnectBtn.addEventListener('click', async () => {
+  if (device && device.gatt && device.gatt.connected) {
+    await device.gatt.disconnect();
+  }
+  statusDot.style.background = '#d32f2f';
+  connectBtn.style.display = 'inline-block';
+  disconnectBtn.style.display = 'none';
+  traineeNameInput.style.display = 'none';
+  startTrainingBtn.style.display = 'none';
+  stopTrainingBtn.style.display = 'none';
+  downloadBtn.style.display = 'none';
+  logging = false;
+  sessionData = [];
+});
+
+/* Training flow: start/stop logging (connection remains) */
+startTrainingBtn.addEventListener('click', () => {
+  const name = traineeNameInput.value.trim();
+  if (!name) { alert('Please enter trainee name.'); return; }
+  traineeName = name;
+  logging = true;
+  sessionData = [];             // clear previous for fresh session
+  traineeNameInput.style.display = 'none';
+  startTrainingBtn.style.display = 'none';
+  stopTrainingBtn.style.display = 'inline-block';
+  downloadBtn.style.display = 'none';
+});
+
+stopTrainingBtn.addEventListener('click', () => {
+  logging = false;
+  stopTrainingBtn.style.display = 'none';
+  // allow CSV download after stopping (connection still alive as requested)
+  if (sessionData.length > 0) downloadBtn.style.display = 'inline-block';
+});
+
+/* CSV export includes Trainee Name, Time, CPR Rate + a small summary row at bottom */
+downloadBtn.addEventListener('click', () => {
+  if (sessionData.length === 0) {
+    alert('No data to download.');
+    return;
+  }
+  // CSV header
+  let csv = 'Trainee Name,Time,CPR Rate\n';
+  sessionData.forEach(r => {
+    csv += `${escapeCsv(r.trainee)},${r.time},${r.rate}\n`;
+  });
+
+  // Add summary: avg,min,max,time_in_target (optional quick summary)
+  const rates = sessionData.map(r => r.rate);
+  const sum = rates.reduce((a,b) => a+b, 0);
+  const avg = (sum / rates.length).toFixed(2);
+  const min = Math.min(...rates).toFixed(2);
+  const max = Math.max(...rates).toFixed(2);
+  const inTargetCount = sessionData.filter(r => r.rate >= 100 && r.rate <= 120).length;
+  const pctInTarget = ((inTargetCount / sessionData.length) * 100).toFixed(1);
+
+  csv += `\nSummary,,\n`;
+  csv += `Average,${avg},\n`;
+  csv += `Min,${min},\n`;
+  csv += `Max,${max},\n`;
+  csv += `Percent in 100-120 CPM,${pctInTarget}%,\n`;
+
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${traineeName || 'trainee'}_cpr_session.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+});
+
+/* small CSV escape helper */
+function escapeCsv(val) {
+  if (typeof val !== 'string') return val;
+  if (val.includes(',') || val.includes('"') || val.includes('\n')) {
+    return `"${val.replace(/"/g, '""')}"`;
+  }
+  return val;
+}
+
+/* draw ticks on load */
+drawTicks();
+
+/* PWA service worker */
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('service-worker.js').then(() => {
+    console.log('Service Worker Registered');
+  }).catch(err => console.log('SW failed', err));
+}
+</script>
+</body>
+</html>
